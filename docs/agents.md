@@ -209,6 +209,14 @@ Things that tripped up a long agent-driven session (a multi-scene 3D piece built
 - **Save early in headless mode.** Without `--autosave` the headless server keeps the project in
   memory only, so a server restart loses unsaved work: start it with `mcp --autosave` (see above)
   or call `save_project {"path": …}` after each milestone.
+- **Modal dialogs in the desktop app.** A modal dialog (a form such as Interpret Footage, which
+  Ask User opens after importing footage with unlabeled alpha, Composition Settings, the
+  unsaved-changes prompt) takes every click and key. Engine commands still run, but bridge
+  `ui_click`, `ui_drag` and scrolls outside the dialog fail with "a modal dialog is open (…)",
+  naming its buttons; close it first (`ui_click` on `form.ok` / `form.cancel`). `ui_inspect`
+  reports it as `modal: {dialog, title, rect, elements}` (`null` when none is open), and input
+  replies carry `{"modal": …}` while one is open after the input. Import with `alpha` (see the
+  cookbook) so Interpret Footage doesn't open.
 - **Environment light.** `layer.newLight` also accepts `"kind":"Environment"`: an equirectangular
   image that metallic surfaces reflect. Set its `lightOptions/source` to a footage, comp or solid
   layer by layer id; with no source it uses the comp's Environment Layer (`layer.environment`)
