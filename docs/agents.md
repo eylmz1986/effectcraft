@@ -279,6 +279,17 @@ build real projects through these interfaces; they are worked examples of everyt
   colour bars, as in After Effects. `file.interpretFootage {"items":[id], "frameRate":12,
   "startTimecode":1001}` conforms them and sets Override Start (the item and layers that ran to its end get the new
   length). See [footage.md](footage.md).
+* **Unlabeled alpha**: TGA, TIFF and movies with alpha (ProRes 4444, QuickTime Animation…) don't
+  say whether it is straight or premultiplied. With Settings ▸ Import ▸ Interpret Unlabeled Alpha
+  As on Ask User (the default) the desktop app opens Interpret Footage, a modal form, after the
+  import. Pass `alpha` to decide while importing and never ask:
+  `file.import {"paths": ["/r/key.mov"], "alpha": "premultiplied"}` (`straight`,
+  `premultiplied`, `ignore`, or `guess`: Interpret Footage ▸ Guess from the first frame, else
+  premultiplied movies and straight stills). Files that state their alpha (PNG, OpenEXR, PSD…)
+  keep it. The reply lists `unlabeledAlpha` (the items whose alpha is unlabeled), `askedAlpha`
+  (those Ask User opened Interpret Footage for) and `alphaInterpretation: [{item, alpha,
+  matteColor, from: "alpha"|"settings"|"ask"}]`. Change it later with `file.interpretFootage
+  {"items":[id], "alpha": …}`.
 * **Colour of footage**: `file.interpretFootage {"items":[id], "preserveRgb":true}` is Interpret
   Footage ▸ Preserve RGB: the file's values unconverted (float EXRs stay linear), for a
   per-layer OCIO conversion or data passes.
