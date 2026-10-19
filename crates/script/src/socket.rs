@@ -51,11 +51,14 @@ mod imp {
     use std::collections::BTreeMap;
     use std::io::{ErrorKind, Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use super::*;
 
+    /// Streams are non-blocking: on Windows `shutdown` doesn't wake a call blocked on another
+    /// handle of the socket, so reads and writes wait in short naps and notice `close` in between.
     enum Sock {
         Stream { s: TcpStream, buf: Vec<u8>, eof: bool },
         Listener(TcpListener),
@@ -66,8 +69,10 @@ mod imp {
     struct Entry {
         sock: Mutex<Sock>,
         /// A second handle on a stream, so `close` can shut it down while another call is
-        /// blocked reading or writing it.
+        /// waiting to read or write it.
         wake: Option<TcpStream>,
+        /// Set by `close`; a call waiting on the socket gives up at its next try.
+        closed: AtomicBool,
     }
 
     struct Table {
@@ -85,7 +90,7 @@ mod imp {
             Sock::Stream { s, .. } => s.try_clone().ok(),
             Sock::Listener(_) => None,
         };
-        let entry = Arc::new(Entry { sock: Mutex::new(s), wake });
+        let entry = Arc::new(Entry { sock: Mutex::new(s), wake, closed: AtomicBool::new(false) });
         let mut t = table().lock().unwrap_or_else(|e| e.into_inner());
         let id = t.next;
         t.next += 1;
@@ -98,12 +103,31 @@ mod imp {
         table().lock().unwrap_or_else(|e| e.into_inner()).socks.get(&id).cloned()
     }
 
-    /// Forget socket `id`; a call blocked on it fails at once.
+    /// Forget socket `id`; a call waiting on it gives up at once.
     fn close(id: u32) {
         let entry = table().lock().unwrap_or_else(|e| e.into_inner()).socks.remove(&id);
+        if let Some(e) = &entry {
+            e.closed.store(true, Ordering::Release);
+        }
         if let Some(w) = entry.as_ref().and_then(|e| e.wake.as_ref()) {
             let _ = w.shutdown(Shutdown::Both);
         }
+    }
+
+    /// The first and the longest nap of a call waiting on a stream that would block: short at
+    /// first so replies come quickly, longer while the other side stays quiet.
+    const NAP: (Duration, Duration) = (Duration::from_millis(1), Duration::from_millis(10));
+
+    /// Nap before trying a stream that would block again; `false` once `end` has passed or the
+    /// socket was closed.
+    fn wait(end: Instant, closed: &AtomicBool, nap: &mut Duration) -> bool {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() || closed.load(Ordering::Acquire) {
+            return false;
+        }
+        std::thread::sleep((*nap).min(left));
+        *nap = nap.saturating_mul(2).min(NAP.1);
+        true
     }
 
     fn timeout(p: &J) -> Duration {
@@ -125,29 +149,52 @@ mod imp {
         if utf8 { String::from_utf8_lossy(b).into_owned() } else { b.iter().map(|&c| c as char).collect() }
     }
 
-    /// Fill a stream's buffer until `done(buf)` or the timeout / end of stream. Fails only when
-    /// the read deadline can't be set.
-    fn fill(s: &mut TcpStream, buf: &mut Vec<u8>, eof: &mut bool, limit: Duration, done: impl Fn(&[u8]) -> bool) -> std::io::Result<()> {
+    /// Fill a stream's buffer until `done(buf)`, the timeout, the end of the stream or `close`.
+    fn fill(s: &mut TcpStream, buf: &mut Vec<u8>, eof: &mut bool, limit: Duration, closed: &AtomicBool, done: impl Fn(&[u8]) -> bool) {
         let end = Instant::now() + limit;
         let mut chunk = [0u8; 4096];
+        let mut nap = NAP.0;
         while !done(buf) && !*eof {
-            let left = end.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                break;
-            }
-            s.set_read_timeout(Some(left.max(Duration::from_millis(1))))?;
             match s.read(&mut chunk) {
                 Ok(0) => *eof = true,
-                Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => {
-                    if e.kind() != ErrorKind::Interrupted {
+                Ok(n) => {
+                    buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
+                    nap = NAP.0;
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    if !wait(end, closed, &mut nap) {
                         break;
                     }
                 }
                 Err(_) => *eof = true,
             }
         }
-        Ok(())
+    }
+
+    /// Write all of `data` within `limit`: `WouldBlock` if the other side stops reading,
+    /// `NotConnected` if the socket is closed meanwhile.
+    fn send(s: &mut TcpStream, mut data: &[u8], limit: Duration, closed: &AtomicBool) -> std::io::Result<()> {
+        let end = Instant::now() + limit;
+        let mut nap = NAP.0;
+        while !data.is_empty() {
+            match s.write(data) {
+                Ok(0) => return Err(ErrorKind::WriteZero.into()),
+                Ok(n) => {
+                    data = data.get(n..).unwrap_or_default();
+                    nap = NAP.0;
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    if !wait(end, closed, &mut nap) {
+                        let closed = closed.load(Ordering::Acquire);
+                        return Err(if closed { std::io::Error::new(ErrorKind::NotConnected, "the socket was closed") } else { e });
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        s.flush()
     }
 
     pub(super) fn run(op: &str, id: u32, p: &J) -> J {
@@ -165,6 +212,9 @@ mod imp {
                     match TcpStream::connect_timeout(&a, limit) {
                         Ok(s) => {
                             let _ = s.set_nodelay(true);
+                            if let Err(e) = s.set_nonblocking(true) {
+                                return err(format!("cannot use the connection to {host}: {e}"));
+                            }
                             return json!({"id": add(Sock::Stream { s, buf: vec![], eof: false })});
                         }
                         Err(e) => last = e.to_string(),
@@ -201,7 +251,7 @@ mod imp {
                 match (op, &mut *sock) {
                     ("poll", Sock::Listener(l)) => match l.accept() {
                         Ok((s, peer)) => {
-                            if let Err(e) = s.set_nonblocking(false) {
+                            if let Err(e) = s.set_nonblocking(true) {
                                 return err(format!("cannot use the connection from {peer}: {e}"));
                             }
                             let host = peer.to_string();
@@ -211,15 +261,13 @@ mod imp {
                     },
                     ("connected", Sock::Stream { s, buf, eof }) => {
                         if !*eof && buf.is_empty() {
-                            // Peek without blocking to notice a closed peer.
-                            let _ = s.set_nonblocking(true);
+                            // Peek (the stream doesn't block) to notice a closed peer.
                             let mut b = [0u8; 1];
                             match s.peek(&mut b) {
                                 Ok(0) => *eof = true,
                                 Err(e) if e.kind() != ErrorKind::WouldBlock => *eof = true,
                                 _ => {}
                             }
-                            let _ = s.set_nonblocking(false);
                         }
                         json!({"value": !(*eof && buf.is_empty())})
                     }
@@ -229,25 +277,19 @@ mod imp {
                         let count = p.get("count").and_then(J::as_i64).unwrap_or(-1);
                         let limit = timeout(p);
                         if count < 0 {
-                            if let Err(e) = fill(s, buf, eof, limit, |_| false) {
-                                return err(format!("cannot set the read timeout: {e}"));
-                            }
+                            fill(s, buf, eof, limit, &entry.closed, |_| false);
                             let all = std::mem::take(buf);
                             json!({"data": decode(&all, utf8)})
                         } else {
                             let n = count as usize;
-                            if let Err(e) = fill(s, buf, eof, limit, |b| b.len() >= n) {
-                                return err(format!("cannot set the read timeout: {e}"));
-                            }
+                            fill(s, buf, eof, limit, &entry.closed, |b| b.len() >= n);
                             let take = n.min(buf.len());
                             let out: Vec<u8> = buf.drain(..take).collect();
                             json!({"data": decode(&out, utf8)})
                         }
                     }
                     ("readln", Sock::Stream { s, buf, eof }) => {
-                        if let Err(e) = fill(s, buf, eof, timeout(p), |b| b.contains(&b'\n')) {
-                            return err(format!("cannot set the read timeout: {e}"));
-                        }
+                        fill(s, buf, eof, timeout(p), &entry.closed, |b| b.contains(&b'\n'));
                         let line: Vec<u8> = match buf.iter().position(|&c| c == b'\n') {
                             Some(i) => {
                                 let mut l: Vec<u8> = buf.drain(..=i).collect();
@@ -265,11 +307,8 @@ mod imp {
                         // A peer that stops reading fills the buffers: give up after `timeout`
                         // instead of blocking the script for good (#1248).
                         let limit = timeout(p).max(Duration::from_millis(1));
-                        if let Err(e) = s.set_write_timeout(Some(limit)) {
-                            return err(format!("cannot set the write timeout: {e}"));
-                        }
                         let data = p.get("data").and_then(J::as_str).unwrap_or("");
-                        match s.write_all(&encode(data, utf8)).and_then(|_| s.flush()) {
+                        match send(s, &encode(data, utf8), limit, &entry.closed) {
                             Ok(()) => json!({"ok": true}),
                             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => err(format!(
                                 "write timed out after {} s: the other side isn't reading (some of the data may have been sent)",
@@ -362,5 +401,20 @@ mod tests {
         let r = blocked.recv_timeout(Duration::from_secs(5)).expect("A's write ended when A was closed");
         assert!(r.get("error").is_some(), "{r}");
         run("close", b, &J::Null);
+    }
+
+    #[test]
+    fn close_ends_a_read_that_waits_for_a_quiet_peer() {
+        // On Windows `shutdown` doesn't wake a blocked read: it waited out its timeout.
+        let (host, _keep) = stalled_peer();
+        let id = open(&host);
+        let (tx, waiting) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(run("read", id, &json!({"count": 1, "timeout": 60})));
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        within(Duration::from_secs(3), move || run("close", id, &J::Null)).expect("close returned while the read waited");
+        let r = waiting.recv_timeout(Duration::from_secs(5)).expect("the read ended when the socket was closed");
+        assert_eq!(r["data"], "", "{r}");
     }
 }
