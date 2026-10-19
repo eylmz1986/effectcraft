@@ -359,6 +359,21 @@ mod tests {
         "x".repeat(64 * 1024 * 1024)
     }
 
+    /// Write to `id` until a write times out, so the next one has to wait. Windows takes a whole
+    /// write into its buffers while they have room, however big it is, so the first writes may
+    /// go through.
+    fn fill_up(id: u32) {
+        let data = big();
+        for _ in 0..8 {
+            let r = run("write", id, &json!({"data": data, "timeout": 0.2}));
+            if let Some(e) = r.get("error") {
+                assert!(e.as_str().is_some_and(|e| e.contains("timed out")), "{r}");
+                return;
+            }
+        }
+        panic!("the writes to socket {id} never filled its buffers");
+    }
+
     /// Run `f` on a thread; its result, or `None` if it takes longer than `limit`.
     fn within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
         let (tx, rx) = mpsc::channel();
@@ -373,11 +388,12 @@ mod tests {
         // #1248: it used to block for good.
         let (host, _keep) = stalled_peer();
         let id = open(&host);
+        within(Duration::from_secs(60), move || fill_up(id)).expect("the writes gave up");
         let data = big();
         let t0 = Instant::now();
         let r = within(Duration::from_secs(20), move || run("write", id, &json!({"data": data, "timeout": 1}))).expect("the write gave up");
         assert!(r["error"].as_str().is_some_and(|e| e.contains("timed out")), "{r}");
-        assert!(t0.elapsed() < Duration::from_secs(15), "{:?}", t0.elapsed());
+        assert!(t0.elapsed() >= Duration::from_millis(900) && t0.elapsed() < Duration::from_secs(15), "{:?}", t0.elapsed());
         run("close", id, &J::Null);
     }
 
@@ -387,6 +403,7 @@ mod tests {
         let (host_b, _keep_b) = stalled_peer();
         let (a, b) = (open(&host_a), open(&host_b));
         // A write on A that would wait a minute.
+        within(Duration::from_secs(60), move || fill_up(a)).expect("the writes gave up");
         let data = big();
         let (tx, blocked) = mpsc::channel();
         std::thread::spawn(move || {
